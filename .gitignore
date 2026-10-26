@@ -133,3 +133,9 @@ ehthumbs_vista.db
 [Dd]esktop.ini
 $RECYCLE.BIN/
 *.lnk
+
+# Always allow verification evidence logs and test summaries under reports/evidence/
+!reports/
+!reports/evidence/
+!reports/evidence/**
+
