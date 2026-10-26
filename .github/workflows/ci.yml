@@ -1,0 +1,119 @@
+name: SystemBoost Pro CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+      - 'fix/**'
+      - 'chore/**'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
+  BUILD_CONFIGURATION: Release
+  # Safety guard: Ensure any code or test aware of CI never runs real system modifications
+  SYSTEMBOOST_SAFE_CI: 'true'
+
+jobs:
+  build-and-test:
+    name: Windows Build & Test (.NET 10 WPF)
+    runs-on: windows-latest
+    # Policy (Rule 13): Never deploy, execute system cleanup, or modify Windows settings in CI.
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          include-prerelease: true
+
+      - name: Verify .NET SDK Environment
+        shell: pwsh
+        run: |
+          dotnet --info
+
+      - name: Restore Dependencies
+        id: restore
+        shell: pwsh
+        run: |
+          $projects = Get-ChildItem -Path . -Recurse -Include *.sln, *.slnx, *.csproj -File
+          if ($projects.Count -eq 0) {
+            Write-Host "No .NET solution or project files found yet (Supervision Infrastructure phase). Skipping restore."
+            "has_projects=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          "has_projects=true" >> $env:GITHUB_OUTPUT
+          dotnet restore
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Dependency restore failed with exit code $LASTEXITCODE."
+            exit $LASTEXITCODE
+          }
+
+      - name: Build Solution
+        id: build
+        if: steps.restore.outputs.has_projects == 'true'
+        shell: pwsh
+        run: |
+          dotnet build --configuration $env:BUILD_CONFIGURATION --no-restore
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Solution build failed with exit code $LASTEXITCODE."
+            exit $LASTEXITCODE
+          }
+
+      - name: Execute Available Tests
+        id: test
+        if: steps.restore.outputs.has_projects == 'true'
+        shell: pwsh
+        run: |
+          $testProjects = Get-ChildItem -Path . -Recurse -Filter *Test*.csproj -File
+          if ($testProjects.Count -eq 0) {
+            Write-Host "No test projects (*Test*.csproj) found yet. Running solution-level dotnet test check..."
+          }
+          dotnet test --configuration $env:BUILD_CONFIGURATION --no-build --verbosity normal --logger "trx;LogFileName=test-results.trx" --results-directory ./TestResults
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Test execution failed with exit code $LASTEXITCODE."
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload Test Results Artifact
+        if: always() && steps.restore.outputs.has_projects == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-trx
+          path: ./TestResults/**/*.trx
+          if-no-files-found: ignore
+
+      - name: Report Build and Test Status
+        if: always()
+        shell: pwsh
+        run: |
+          $hasProjects = "${{ steps.restore.outputs.has_projects }}"
+          $restoreOutcome = "${{ steps.restore.outcome }}"
+          $buildOutcome = "${{ steps.build.outcome }}"
+          $testOutcome = "${{ steps.test.outcome }}"
+
+          "## SystemBoost Pro CI Report" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| Stage | Outcome |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| :--- | :--- |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| **Projects Detected** | `$hasProjects` |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| **Restore Dependencies** | `$restoreOutcome` |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| **Build Solution** | `$buildOutcome` |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| **Execute Tests** | `$testOutcome` |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "> **Safety Policy:** No deployment, system cleanup, or Windows OS modifications are executed during CI." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          if ($restoreOutcome -eq 'failure' -or $buildOutcome -eq 'failure' -or $testOutcome -eq 'failure') {
+            Write-Error "CI pipeline detected build or test failures. Check step logs and uploaded TRX artifacts."
+            exit 1
+          }
