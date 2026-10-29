@@ -1,0 +1,220 @@
+name: SystemBoost Pro CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+      - 'fix/**'
+      - 'chore/**'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
+  BUILD_CONFIGURATION: Release
+  # Outer CI boundary flag (Defense-in-Depth Layer 4; enforced alongside runtime guards and test sandboxes)
+  SYSTEMBOOST_SAFE_CI: 'true'
+  # Explicit solution and project paths required once Phase 1 (.NET solution) is introduced
+  SOLUTION_PATH: 'SystemBoostPro.sln'
+  APP_PROJECT_PATH: 'src/SystemBoostPro.App/SystemBoostPro.App.csproj'
+  CORE_PROJECT_PATH: 'src/SystemBoostPro.Core/SystemBoostPro.Core.csproj'
+  INFRA_PROJECT_PATH: 'src/SystemBoostPro.Infrastructure/SystemBoostPro.Infrastructure.csproj'
+  TEST_PROJECT_PATH: 'tests/SystemBoostPro.Tests/SystemBoostPro.Tests.csproj'
+
+jobs:
+  build-and-test:
+    name: Windows Build & Test (.NET 10 WPF)
+    runs-on: windows-latest
+    # Policy (Rule 13): Never deploy, execute system cleanup, or modify Windows settings in CI.
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Validate Supervision Infrastructure & Solution Structure
+        id: validate_infra
+        shell: pwsh
+        run: |
+          Write-Host "=== 1. Verifying .NET 10 SDK Environment ==="
+          dotnet --info
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error ".NET SDK verification failed."
+            exit 1
+          }
+
+          Write-Host "=== 2. Verifying Required Supervision Documentation & Governance Files ==="
+          $requiredDocs = @(
+            '.gitignore',
+            '.github/workflows/ci.yml',
+            'AGENTS.md',
+            'docs/ARCHITECTURE.md',
+            'docs/PROGRESS.md',
+            'docs/QA_REPORT.md',
+            'docs/REVIEW_REQUEST.md'
+          )
+          $missingDocs = @()
+          foreach ($doc in $requiredDocs) {
+            if (-not (Test-Path -Path $doc -PathType Leaf)) {
+              $missingDocs += $doc
+            }
+          }
+          if ($missingDocs.Count -gt 0) {
+            Write-Error "Missing required supervision infrastructure files: $($missingDocs -join ', ')"
+            exit 1
+          }
+          Write-Host "All required supervision infrastructure files are present."
+
+          Write-Host "=== 3. Checking Solution & Project Structure ==="
+          $anyDotNetFiles = Get-ChildItem -Path . -Recurse -Include *.sln, *.slnx, *.csproj -File
+          if ($anyDotNetFiles.Count -eq 0) {
+            Write-Host "Repository is currently in Phase 0 (Supervision Infrastructure Only)."
+            Write-Host "No .NET solution or project files exist yet. Application compilation and automated tests will be marked as NOT EXECUTED."
+            "pipeline_mode=infrastructure_only" >> $env:GITHUB_OUTPUT
+            "has_solution=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          Write-Host ".NET files detected. Enforcing explicit solution and project path validation..."
+          "pipeline_mode=application_build_and_test" >> $env:GITHUB_OUTPUT
+
+          $requiredDotNetPaths = @(
+            $env:SOLUTION_PATH,
+            $env:APP_PROJECT_PATH,
+            $env:CORE_PROJECT_PATH,
+            $env:INFRA_PROJECT_PATH,
+            $env:TEST_PROJECT_PATH
+          )
+          $missingProjects = @()
+          foreach ($reqPath in $requiredDotNetPaths) {
+            if (-not (Test-Path -Path $reqPath -PathType Leaf)) {
+              $missingProjects += $reqPath
+            }
+          }
+          if ($missingProjects.Count -gt 0) {
+            Write-Error "Solution structure validation failed! Missing required solution/project files: $($missingProjects -join ', ')"
+            "has_solution=false" >> $env:GITHUB_OUTPUT
+            exit 1
+          }
+
+          Write-Host "Explicit solution ($env:SOLUTION_PATH) and all required application/test projects verified."
+          "has_solution=true" >> $env:GITHUB_OUTPUT
+
+      - name: Restore Dependencies (Application Compilation Stage)
+        id: restore
+        if: steps.validate_infra.outputs.has_solution == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Restoring dependencies for explicit solution: $env:SOLUTION_PATH"
+          dotnet restore $env:SOLUTION_PATH
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Dependency restore failed for $env:SOLUTION_PATH with exit code $LASTEXITCODE."
+            exit $LASTEXITCODE
+          }
+
+      - name: Build Solution (Application Compilation Stage)
+        id: build
+        if: steps.validate_infra.outputs.has_solution == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Building solution: $env:SOLUTION_PATH (Configuration: $env:BUILD_CONFIGURATION)"
+          dotnet build $env:SOLUTION_PATH --configuration $env:BUILD_CONFIGURATION --no-restore
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Solution compilation failed for $env:SOLUTION_PATH with exit code $LASTEXITCODE."
+            exit $LASTEXITCODE
+          }
+
+      - name: Execute Automated Tests (Test Execution Stage)
+        id: test
+        if: steps.validate_infra.outputs.has_solution == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Executing automated tests for test project: $env:TEST_PROJECT_PATH"
+          dotnet test $env:SOLUTION_PATH --configuration $env:BUILD_CONFIGURATION --no-build --verbosity normal --logger "trx;LogFileName=test-results.trx" --results-directory ./TestResults
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Automated test execution failed with exit code $LASTEXITCODE."
+            exit $LASTEXITCODE
+          }
+
+          $trxFiles = Get-ChildItem -Path ./TestResults -Recurse -Filter *.trx -File -ErrorAction SilentlyContinue
+          if (-not $trxFiles -or $trxFiles.Count -eq 0) {
+            Write-Error "No TRX test result files were produced! Failing CI because required automated tests did not run."
+            exit 1
+          }
+
+      - name: Upload Test Results Artifact
+        if: always() && steps.validate_infra.outputs.has_solution == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-trx
+          path: ./TestResults/**/*.trx
+          if-no-files-found: error
+
+      - name: Report CI Validation, Compilation, and Test Status
+        if: always()
+        shell: pwsh
+        run: |
+          $pipelineMode = "${{ steps.validate_infra.outputs.pipeline_mode }}"
+          $hasSolution = "${{ steps.validate_infra.outputs.has_solution }}"
+          $infraOutcome = "${{ steps.validate_infra.outcome }}"
+          $restoreOutcome = "${{ steps.restore.outcome }}"
+          $buildOutcome = "${{ steps.build.outcome }}"
+          $testOutcome = "${{ steps.test.outcome }}"
+
+          if ($infraOutcome -eq 'success') {
+            $infraDisplay = "PASSED"
+          } else {
+            $infraDisplay = "FAILED ($infraOutcome)"
+          }
+
+          if ($hasSolution -ne 'true') {
+            $compilationDisplay = "NOT EXECUTED (No Application Solution Present — Infrastructure-Only Phase)"
+            $testDisplay = "NOT EXECUTED (No Unit/Integration Tests Present — Infrastructure-Only Phase)"
+          } else {
+            if ($restoreOutcome -eq 'success' -and $buildOutcome -eq 'success') {
+              $compilationDisplay = "PASSED (Restore: $restoreOutcome, Build: $buildOutcome)"
+            } else {
+              $compilationDisplay = "FAILED (Restore: $restoreOutcome, Build: $buildOutcome)"
+            }
+
+            if ($testOutcome -eq 'success') {
+              $testDisplay = "PASSED"
+            } else {
+              $testDisplay = "FAILED ($testOutcome)"
+            }
+          }
+
+          "## SystemBoost Pro CI Validation Report" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- **Pipeline Mode:** `$pipelineMode`" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- **Target Solution Path:** `$($env:SOLUTION_PATH)`" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| Validation Category | Status | Details |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| :--- | :--- | :--- |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| **1. Infrastructure Validation** | **$infraDisplay** | `.NET 10 SDK` setup & supervision governance file check |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| **2. Application Compilation** | **$compilationDisplay** | `dotnet restore` & `dotnet build` on `$($env:SOLUTION_PATH)` |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| **3. Automated Test Execution** | **$testDisplay** | `dotnet test` on `$($env:TEST_PROJECT_PATH)` |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          if ($hasSolution -ne 'true') {
+            "> [!WARNING]" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            "> **Infrastructure-Only Run:** This workflow verified repository supervision infrastructure and `.NET 10 SDK` availability only. **Application compilation and automated unit tests were NOT executed** because Phase 1 application code has not been introduced yet. This run must never be cited as proof that application compilation or unit tests succeeded." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+          "> **Safety Policy:** No deployment, system cleanup, or Windows OS modifications are executed during CI." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          if ($infraOutcome -eq 'failure' -or $restoreOutcome -eq 'failure' -or $buildOutcome -eq 'failure' -or $testOutcome -eq 'failure') {
+            Write-Error "CI pipeline failed in one or more stages. Review step logs and summary for details."
+            exit 1
+          }
